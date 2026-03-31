@@ -5,9 +5,9 @@ spring:
       on-profile: docker
 
   datasource:
-    url: jdbc:postgresql://postgres:5432/propertize_db
+    url: jdbc:postgresql://postgres:5432/propertize_db?stringtype=unspecified
     username: dbuser
-    password: dbpassword
+    password: ${DB_PASSWORD:${POSTGRES_PASSWORD:dbpassword}}
     driver-class-name: org.postgresql.Driver
     hikari:
       maximum-pool-size: 15
@@ -30,6 +30,8 @@ spring:
       hibernate:
         dialect: org.hibernate.dialect.PostgreSQLDialect
         format_sql: false
+        type:
+          preferred_uuid_jdbc_type: UUID
 
   data:
     redis:
