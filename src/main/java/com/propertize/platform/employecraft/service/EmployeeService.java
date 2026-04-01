@@ -39,6 +39,7 @@ import org.springframework.web.context.request.ServletRequestAttributes;
 import java.time.LocalDateTime;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -58,33 +59,97 @@ public class EmployeeService {
     private final EmployeeNumberGenerator employeeNumberGenerator;
     private final EmployeeEventPublisher eventPublisher;
 
+    /**
+     * List employees. Accepts an optional organizationId override for platform
+     * admin users whose JWT may carry no org context.
+     * If neither param nor context is set (true platform-wide request) an empty
+     * page is returned rather than throwing 409.
+     */
     @Transactional(readOnly = true)
-    public Page<EmployeeResponse> getAllEmployees(Pageable pageable) {
-        UUID organizationId = OrganizationContext.requireOrganizationId();
+    public Page<EmployeeResponse> getAllEmployees(UUID organizationIdParam, Pageable pageable) {
+        UUID organizationId = organizationIdParam != null
+                ? organizationIdParam
+                : OrganizationContext.getOrganizationId();
+        if (organizationId == null) {
+            logger.info("No organization context — returning empty employee page for platform user");
+            return Page.empty(pageable);
+        }
         Page<Employee> employees = employeeRepository.findByOrganizationId(organizationId.toString(), pageable);
         return employees.map(this::toResponse);
     }
 
     @Transactional(readOnly = true)
     public EmployeeResponse getEmployee(UUID employeeId) {
-        UUID organizationId = OrganizationContext.requireOrganizationId();
-        Employee employee = employeeRepository
-                .findByIdAndOrganizationId(employeeId.toString(), organizationId.toString())
+        UUID organizationId = OrganizationContext.getOrganizationId();
+        if (organizationId != null) {
+            return employeeRepository
+                    .findByIdAndOrganizationId(employeeId.toString(), organizationId.toString())
+                    .map(this::toResponse)
+                    .orElseThrow(() -> new EmployeeNotFoundException(employeeId));
+        }
+        // Platform users with no org context — look up by id only
+        return employeeRepository.findById(employeeId)
+                .map(this::toResponse)
                 .orElseThrow(() -> new EmployeeNotFoundException(employeeId));
-        return toResponse(employee);
     }
 
+    /**
+     * Look up employee by the linked auth-service userId.
+     * Returns 404 (not 409) when the user has no employee record — gracefully
+     * handles users who are customers or platform staff, not org employees.
+     */
     @Transactional(readOnly = true)
     public EmployeeResponse getEmployeeByUserId(Long userId) {
-        UUID organizationId = OrganizationContext.requireOrganizationId();
-        Employee employee = employeeRepository.findByUserIdAndOrganizationId(userId, organizationId.toString())
-                .orElseThrow(() -> new EmployeeNotFoundException("No employee found for user: " + userId));
-        return toResponse(employee);
+        UUID organizationId = OrganizationContext.getOrganizationId();
+        Optional<Employee> employee = organizationId != null
+                ? employeeRepository.findByUserIdAndOrganizationId(userId, organizationId.toString())
+                : employeeRepository.findByUserId(userId);
+        return employee
+                .map(this::toResponse)
+                .orElseThrow(() -> new EmployeeNotFoundException("No employee record found for user: " + userId));
+    }
+
+    /**
+     * Return the employee profile of the currently authenticated user, or empty
+     * if the caller has no employee record (e.g. platform staff, customers).
+     */
+    @Transactional(readOnly = true)
+    public java.util.Optional<EmployeeResponse> getMyEmployeeProfile() {
+        try {
+            jakarta.servlet.http.HttpServletRequest req =
+                    ((org.springframework.web.context.request.ServletRequestAttributes)
+                            org.springframework.web.context.request.RequestContextHolder.getRequestAttributes())
+                            .getRequest();
+            String userIdStr = req.getHeader("X-User-Id");
+            if (userIdStr == null || userIdStr.isBlank()) return java.util.Optional.empty();
+            Long userId = Long.parseLong(userIdStr);
+            UUID organizationId = OrganizationContext.getOrganizationId();
+            Optional<Employee> employee = organizationId != null
+                    ? employeeRepository.findByUserIdAndOrganizationId(userId, organizationId.toString())
+                    : employeeRepository.findByUserId(userId);
+            return employee.map(this::toResponse);
+        } catch (Exception e) {
+            logger.debug("Could not resolve employee profile: {}", e.getMessage());
+            return java.util.Optional.empty();
+        }
     }
 
     @Transactional
     public EmployeeResponse createEmployee(EmployeeCreateRequest request) {
-        UUID organizationId = OrganizationContext.requireOrganizationId();
+        return createEmployee(request, null);
+    }
+
+    /**
+     * Create a new employee.
+     * If {@code organizationIdParam} is provided it takes precedence over the
+     * thread-local {@link OrganizationContext} — useful for service-to-service
+     * calls (e.g. OnboardingService provisioning an org owner employee).
+     */
+    @Transactional
+    public EmployeeResponse createEmployee(EmployeeCreateRequest request, UUID organizationIdParam) {
+        UUID organizationId = organizationIdParam != null
+                ? organizationIdParam
+                : OrganizationContext.requireOrganizationId();
 
         // Validate email uniqueness
         if (employeeRepository.countByEmailAndOrganizationId(request.getEmail(), organizationId.toString()) > 0) {
@@ -137,6 +202,9 @@ public class EmployeeService {
         if (request.isCreateSystemAccess()) {
             Long userId = createUserInPropertize(request, organizationId);
             employee.setUserId(userId);
+        } else if (request.getUserId() != null) {
+            // Link to an existing auth-service user (e.g., org owner provisioned by OnboardingService)
+            employee.setUserId(request.getUserId());
         }
 
         Employee saved = employeeRepository.save(employee);
